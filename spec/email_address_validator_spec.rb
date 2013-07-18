@@ -59,6 +59,12 @@ describe EmailAddressValidator do
     end
   end
 
+  VALID.each do |addr|
+    it "should recognize <#{addr}> as valid" do
+      EmailAddressValidator.validate_addr(addr).should be_true
+    end
+  end
+
   INVALID.each do |addr|
     it "should recognize <#{addr}> as invalid" do
       EmailAddressValidator.validate_822(addr).should be_false
