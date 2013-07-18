@@ -1,7 +1,7 @@
 class EmailAddressValidator::RFC2822Parser
 # STANDALONE START
     def setup_parser(str, debug=false)
-      @string = str
+      @string = str || ""
       @pos = 0
       @memoizations = Hash.new { |h,k| h[k] = {} }
       @result = nil

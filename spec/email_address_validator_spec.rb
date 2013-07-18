@@ -52,7 +52,11 @@ describe EmailAddressValidator do
   VALID_ADDRSPEC = ["l3tt3rsAndNumb3rs@domain.com", "has-dash@domain.com"]
 
   INVALID = INVALID_COMMON
-
+  
+  it "should be false with a nil value" do
+    EmailAddressValidator.validate_addr(nil).should be_false
+  end
+  
   VALID.each do |addr|
     it "should recognize <#{addr}> as valid" do
       EmailAddressValidator.validate_822(addr).should be_true
