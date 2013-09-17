@@ -1,7 +1,20 @@
+# encoding: binary
 class EmailAddressValidator::RFC2822Parser
-# STANDALONE START
+  # :stopdoc:
+
+    # This is distinct from setup_parser so that a standalone parser
+    # can redefine #initialize and still have access to the proper
+    # parser setup code.
+    def initialize(str, debug=false)
+      setup_parser(str, debug)
+    end
+
+
+
+    # Prepares for parsing +str+.  If you define a custom initialize you must
+    # call this method before #parse
     def setup_parser(str, debug=false)
-      @string = str || ""
+      @string = str
       @pos = 0
       @memoizations = Hash.new { |h,k| h[k] = {} }
       @result = nil
@@ -11,22 +24,11 @@ class EmailAddressValidator::RFC2822Parser
       setup_foreign_grammar
     end
 
-    def setup_foreign_grammar
-    end
-
-    # This is distinct from setup_parser so that a standalone parser
-    # can redefine #initialize and still have access to the proper
-    # parser setup code.
-    #
-    def initialize(str, debug=false)
-      setup_parser(str, debug)
-    end
-
     attr_reader :string
-    attr_reader :result, :failing_rule_offset
-    attr_accessor :pos
+    attr_reader :failing_rule_offset
+    attr_accessor :result, :pos
 
-    # STANDALONE START
+    
     def current_column(target=pos)
       if c = string.rindex("\n", target-1)
         return target - c - 1
@@ -54,7 +56,7 @@ class EmailAddressValidator::RFC2822Parser
       lines
     end
 
-    #
+
 
     def get_text(start)
       @string[start..@pos-1]
@@ -189,41 +191,37 @@ class EmailAddressValidator::RFC2822Parser
     end
 
     def parse(rule=nil)
+      # We invoke the rules indirectly via apply
+      # instead of by just calling them as methods because
+      # if the rules use left recursion, apply needs to
+      # manage that.
+
       if !rule
-        _root ? true : false
+        apply(:_root)
       else
-        # This is not shared with code_generator.rb so this can be standalone
         method = rule.gsub("-","_hyphen_")
-        __send__("_#{method}") ? true : false
+        apply :"_#{method}"
       end
-    end
-
-    class LeftRecursive
-      def initialize(detected=false)
-        @detected = detected
-      end
-
-      attr_accessor :detected
     end
 
     class MemoEntry
       def initialize(ans, pos)
         @ans = ans
         @pos = pos
-        @uses = 1
         @result = nil
+        @set = false
+        @left_rec = false
       end
 
-      attr_reader :ans, :pos, :uses, :result
-
-      def inc!
-        @uses += 1
-      end
+      attr_reader :ans, :pos, :result, :set
+      attr_accessor :left_rec
 
       def move!(ans, pos, result)
         @ans = ans
         @pos = pos
         @result = result
+        @set = true
+        @left_rec = false
       end
     end
 
@@ -237,6 +235,7 @@ class EmailAddressValidator::RFC2822Parser
       begin
         if val = __send__(rule, *args)
           other.pos = @pos
+          other.result = @result
         else
           other.set_failed_rule "#{self.class}##{rule}"
         end
@@ -247,14 +246,12 @@ class EmailAddressValidator::RFC2822Parser
       end
     end
 
-    def apply(rule)
-      if m = @memoizations[rule][@pos]
-        m.inc!
-
-        prev = @pos
+    def apply_with_args(rule, *args)
+      memo_key = [rule, args]
+      if m = @memoizations[memo_key][@pos]
         @pos = m.pos
-        if m.ans.kind_of? LeftRecursive
-          m.ans.detected = true
+        if !m.set
+          m.left_rec = true
           return nil
         end
 
@@ -262,19 +259,20 @@ class EmailAddressValidator::RFC2822Parser
 
         return m.ans
       else
-        lr = LeftRecursive.new(false)
-        m = MemoEntry.new(lr, @pos)
-        @memoizations[rule][@pos] = m
+        m = MemoEntry.new(nil, @pos)
+        @memoizations[memo_key][@pos] = m
         start_pos = @pos
 
-        ans = __send__ rule
+        ans = __send__ rule, *args
+
+        lr = m.left_rec
 
         m.move! ans, @pos, @result
 
         # Don't bother trying to grow the left recursion
         # if it's failing straight away (thus there is no seed)
-        if ans and lr.detected
-          return grow_lr(rule, start_pos, m)
+        if ans and lr
+          return grow_lr(rule, args, start_pos, m)
         else
           return ans
         end
@@ -283,12 +281,50 @@ class EmailAddressValidator::RFC2822Parser
       end
     end
 
-    def grow_lr(rule, start_pos, m)
+    def apply(rule)
+      if m = @memoizations[rule][@pos]
+        @pos = m.pos
+        if !m.set
+          m.left_rec = true
+          return nil
+        end
+
+        @result = m.result
+
+        return m.ans
+      else
+        m = MemoEntry.new(nil, @pos)
+        @memoizations[rule][@pos] = m
+        start_pos = @pos
+
+        ans = __send__ rule
+
+        lr = m.left_rec
+
+        m.move! ans, @pos, @result
+
+        # Don't bother trying to grow the left recursion
+        # if it's failing straight away (thus there is no seed)
+        if ans and lr
+          return grow_lr(rule, nil, start_pos, m)
+        else
+          return ans
+        end
+
+        return ans
+      end
+    end
+
+    def grow_lr(rule, args, start_pos, m)
       while true
         @pos = start_pos
         @result = m.result
 
-        ans = __send__ rule
+        if args
+          ans = __send__ rule, *args
+        else
+          ans = __send__ rule
+        end
         return nil unless ans
 
         break if @pos <= m.pos
@@ -314,60 +350,62 @@ class EmailAddressValidator::RFC2822Parser
       RuleInfo.new(name, rendered)
     end
 
-    #
+
+  # :startdoc:
 
  attr_accessor :validate_domain 
 
+  # :stopdoc:
   def setup_foreign_grammar; end
 
-  # d = < . > &{ text[0] == num }
+  # d = < . > &{ text[0] == num.chr }
   def _d(num)
 
     _save = self.pos
     while true # sequence
-    _text_start = self.pos
-    _tmp = get_byte
-    if _tmp
-      text = get_text(_text_start)
-    end
-    unless _tmp
-      self.pos = _save
+      _text_start = self.pos
+      _tmp = get_byte
+      if _tmp
+        text = get_text(_text_start)
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save1 = self.pos
+      _tmp = begin;  text[0] == num.chr ; end
+      self.pos = _save1
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _save1 = self.pos
-    _tmp = begin;  text[0] == num ; end
-    self.pos = _save1
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_d unless _tmp
     return _tmp
   end
 
-  # d_btw = < . > &{ t = text[0]; t >= start && t <= fin }
+  # d_btw = < . > &{ t = text[0]; t >= start.chr && t <= fin.chr }
   def _d_btw(start,fin)
 
     _save = self.pos
     while true # sequence
-    _text_start = self.pos
-    _tmp = get_byte
-    if _tmp
-      text = get_text(_text_start)
-    end
-    unless _tmp
-      self.pos = _save
+      _text_start = self.pos
+      _tmp = get_byte
+      if _tmp
+        text = get_text(_text_start)
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save1 = self.pos
+      _tmp = begin;  t = text[0]; t >= start.chr && t <= fin.chr ; end
+      self.pos = _save1
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _save1 = self.pos
-    _tmp = begin;  t = text[0]; t >= start && t <= fin ; end
-    self.pos = _save1
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_d_btw unless _tmp
@@ -379,13 +417,13 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = match_string(" ")
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(9)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = match_string(" ")
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 9)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_WSP unless _tmp
@@ -411,16 +449,16 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_CR)
-    unless _tmp
-      self.pos = _save
+      _tmp = apply(:_CR)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_LF)
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = apply(:_LF)
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_CRLF unless _tmp
@@ -446,22 +484,22 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = _d_btw(1,8)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(11)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(12)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(14,31)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(127)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply_with_args(:_d_btw, 1,8)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 11)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 12)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 14,31)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 127)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_NO_hyphen_WS_hyphen_CTL unless _tmp
@@ -473,22 +511,22 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = _d_btw(1,9)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(11)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(12)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(14,127)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_text)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply_with_args(:_d_btw, 1,9)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 11)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 12)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 14,127)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_text)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_text unless _tmp
@@ -501,26 +539,26 @@ class EmailAddressValidator::RFC2822Parser
     _save = self.pos
     while true # choice
 
-    _save1 = self.pos
-    while true # sequence
-    _tmp = match_string("\\")
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _tmp = apply(:_text)
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
+      _save1 = self.pos
+      while true # sequence
+        _tmp = match_string("\\")
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _tmp = apply(:_text)
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
 
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_qp)
-    break if _tmp
-    self.pos = _save
-    break
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_qp)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_quoted_hyphen_pair unless _tmp
@@ -533,59 +571,59 @@ class EmailAddressValidator::RFC2822Parser
     _save = self.pos
     while true # choice
 
-    _save1 = self.pos
-    while true # sequence
-    _save2 = self.pos
+      _save1 = self.pos
+      while true # sequence
+        _save2 = self.pos
 
-    _save3 = self.pos
-    while true # sequence
-    while true
-    _tmp = apply(:_WSP)
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _tmp = apply(:_CRLF)
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
+        _save3 = self.pos
+        while true # sequence
+          while true
+            _tmp = apply(:_WSP)
+            break unless _tmp
+          end
+          _tmp = true
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _tmp = apply(:_CRLF)
+          unless _tmp
+            self.pos = _save3
+          end
+          break
+        end # end sequence
 
-    unless _tmp
-      _tmp = true
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _save5 = self.pos
-    _tmp = apply(:_WSP)
-    if _tmp
-      while true
+        unless _tmp
+          _tmp = true
+          self.pos = _save2
+        end
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _save5 = self.pos
         _tmp = apply(:_WSP)
-        break unless _tmp
-      end
-      _tmp = true
-    else
-      self.pos = _save5
-    end
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
+        if _tmp
+          while true
+            _tmp = apply(:_WSP)
+            break unless _tmp
+          end
+          _tmp = true
+        else
+          self.pos = _save5
+        end
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
 
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_FWS)
-    break if _tmp
-    self.pos = _save
-    break
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_FWS)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_FWS unless _tmp
@@ -597,19 +635,19 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(33,39)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(42,91)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(93,126)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 33,39)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 42,91)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 93,126)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_ctext unless _tmp
@@ -621,16 +659,16 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_ctext)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_quoted_hyphen_pair)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_comment)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_ctext)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_quoted_hyphen_pair)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_comment)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_ccontent unless _tmp
@@ -642,54 +680,54 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = match_string("(")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      _tmp = match_string("(")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save2 = self.pos
-    while true # sequence
-    _save3 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _tmp = apply(:_ccontent)
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
+        _save2 = self.pos
+        while true # sequence
+          _save3 = self.pos
+          _tmp = apply(:_FWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save3
+          end
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = apply(:_ccontent)
+          unless _tmp
+            self.pos = _save2
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save4 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
+        break unless _tmp
+      end
       _tmp = true
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save4 = self.pos
+      _tmp = apply(:_FWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save4
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string(")")
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string(")")
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_comment unless _tmp
@@ -701,69 +739,69 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    while true
+      while true
 
-    _save2 = self.pos
-    while true # sequence
-    _save3 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
+        _save2 = self.pos
+        while true # sequence
+          _save3 = self.pos
+          _tmp = apply(:_FWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save3
+          end
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = apply(:_comment)
+          unless _tmp
+            self.pos = _save2
+          end
+          break
+        end # end sequence
+
+        break unless _tmp
+      end
       _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save2
+      unless _tmp
+        self.pos = _save
+        break
+      end
+
+      _save4 = self.pos
+      while true # choice
+
+        _save5 = self.pos
+        while true # sequence
+          _save6 = self.pos
+          _tmp = apply(:_FWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save6
+          end
+          unless _tmp
+            self.pos = _save5
+            break
+          end
+          _tmp = apply(:_comment)
+          unless _tmp
+            self.pos = _save5
+          end
+          break
+        end # end sequence
+
+        break if _tmp
+        self.pos = _save4
+        _tmp = apply(:_FWS)
+        break if _tmp
+        self.pos = _save4
+        break
+      end # end choice
+
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = apply(:_comment)
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-
-    _save4 = self.pos
-    while true # choice
-
-    _save5 = self.pos
-    while true # sequence
-    _save6 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save6
-    end
-    unless _tmp
-      self.pos = _save5
-      break
-    end
-    _tmp = apply(:_comment)
-    unless _tmp
-      self.pos = _save5
-    end
-    break
-    end # end sequence
-
-    break if _tmp
-    self.pos = _save4
-    _tmp = apply(:_FWS)
-    break if _tmp
-    self.pos = _save4
-    break
-    end # end choice
-
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_CFWS unless _tmp
@@ -775,70 +813,70 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_ALPHA)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_DIGIT)
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("!")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("#")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("$")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("%")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("&")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("'")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("*")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("+")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("-")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("/")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("=")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("?")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("^")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("_")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("`")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("{")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("|")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("}")
-    break if _tmp
-    self.pos = _save
-    _tmp = match_string("~")
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_ALPHA)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_DIGIT)
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("!")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("#")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("$")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("%")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("&")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("'")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("*")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("+")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("-")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("/")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("=")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("?")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("^")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("_")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("`")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("{")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("|")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("}")
+      break if _tmp
+      self.pos = _save
+      _tmp = match_string("~")
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_atext unless _tmp
@@ -850,41 +888,41 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save2 = self.pos
-    _tmp = apply(:_atext)
-    if _tmp
-      while true
-        _tmp = apply(:_atext)
-        break unless _tmp
+      _save1 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
       end
-      _tmp = true
-    else
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save2 = self.pos
+      _tmp = apply(:_atext)
+      if _tmp
+        while true
+          _tmp = apply(:_atext)
+          break unless _tmp
+        end
+        _tmp = true
+      else
+        self.pos = _save2
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save3 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save3
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _save3 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_atom unless _tmp
@@ -896,31 +934,31 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
+      _save1 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_dot_hyphen_atom_hyphen_text)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save2 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save2
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = apply(:_dot_hyphen_atom_hyphen_text)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save2 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_dot_hyphen_atom unless _tmp
@@ -932,54 +970,54 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_atext)
-    if _tmp
+      _save1 = self.pos
+      _tmp = apply(:_atext)
+      if _tmp
+        while true
+          _tmp = apply(:_atext)
+          break unless _tmp
+        end
+        _tmp = true
+      else
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
       while true
-        _tmp = apply(:_atext)
+
+        _save3 = self.pos
+        while true # sequence
+          _tmp = match_string(".")
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _save4 = self.pos
+          _tmp = apply(:_atext)
+          if _tmp
+            while true
+              _tmp = apply(:_atext)
+              break unless _tmp
+            end
+            _tmp = true
+          else
+            self.pos = _save4
+          end
+          unless _tmp
+            self.pos = _save3
+          end
+          break
+        end # end sequence
+
         break unless _tmp
       end
       _tmp = true
-    else
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
-
-    _save3 = self.pos
-    while true # sequence
-    _tmp = match_string(".")
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _save4 = self.pos
-    _tmp = apply(:_atext)
-    if _tmp
-      while true
-        _tmp = apply(:_atext)
-        break unless _tmp
+      unless _tmp
+        self.pos = _save
       end
-      _tmp = true
-    else
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
+      break
     end # end sequence
 
     set_failed_rule :_dot_hyphen_atom_hyphen_text unless _tmp
@@ -991,19 +1029,19 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(33)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(35,91)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(93,126)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 33)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 35,91)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 93,126)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_qtext unless _tmp
@@ -1015,13 +1053,13 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_qtext)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_quoted_hyphen_pair)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_qtext)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_quoted_hyphen_pair)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_qcontent unless _tmp
@@ -1033,74 +1071,74 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = match_string("\"")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      _save1 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string("\"")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save3 = self.pos
-    while true # sequence
-    _save4 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _tmp = apply(:_qcontent)
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
+        _save3 = self.pos
+        while true # sequence
+          _save4 = self.pos
+          _tmp = apply(:_FWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save4
+          end
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _tmp = apply(:_qcontent)
+          unless _tmp
+            self.pos = _save3
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save5 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
+        break unless _tmp
+      end
       _tmp = true
-      self.pos = _save5
-    end
-    unless _tmp
-      self.pos = _save
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save5 = self.pos
+      _tmp = apply(:_FWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save5
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string("\"")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save6 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save6
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string("\"")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save6 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save6
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_quoted_hyphen_string unless _tmp
@@ -1112,13 +1150,13 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_atom)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_quoted_hyphen_string)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_atom)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_quoted_hyphen_string)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_word unless _tmp
@@ -1130,23 +1168,23 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _save1 = self.pos
-    _tmp = apply(:_word)
-    if _tmp
-      while true
-        _tmp = apply(:_word)
-        break unless _tmp
+      _save1 = self.pos
+      _tmp = apply(:_word)
+      if _tmp
+        while true
+          _tmp = apply(:_word)
+          break unless _tmp
+        end
+        _tmp = true
+      else
+        self.pos = _save1
       end
-      _tmp = true
-    else
-      self.pos = _save1
-    end
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_phrase)
-    break if _tmp
-    self.pos = _save
-    break
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_phrase)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_phrase unless _tmp
@@ -1158,16 +1196,16 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(33,126)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_utext)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 33,126)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_utext)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_utext unless _tmp
@@ -1179,44 +1217,44 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    while true
+      while true
 
-    _save2 = self.pos
-    while true # sequence
-    _save3 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _tmp = apply(:_utext)
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
+        _save2 = self.pos
+        while true # sequence
+          _save3 = self.pos
+          _tmp = apply(:_FWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save3
+          end
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = apply(:_utext)
+          unless _tmp
+            self.pos = _save2
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save4 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
+        break unless _tmp
+      end
       _tmp = true
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save4 = self.pos
+      _tmp = apply(:_FWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save4
+      end
+      unless _tmp
+        self.pos = _save
+      end
+      break
     end # end sequence
 
     set_failed_rule :_unstructured unless _tmp
@@ -1228,13 +1266,13 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_mailbox)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_group)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_mailbox)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_group)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_address unless _tmp
@@ -1246,13 +1284,13 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_name_hyphen_addr)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_addr_hyphen_spec)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_name_hyphen_addr)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_addr_hyphen_spec)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_mailbox unless _tmp
@@ -1264,21 +1302,21 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_display_hyphen_name)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
+      _save1 = self.pos
+      _tmp = apply(:_display_hyphen_name)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_angle_hyphen_addr)
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = apply(:_angle_hyphen_addr)
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_name_hyphen_addr unless _tmp
@@ -1291,51 +1329,51 @@ class EmailAddressValidator::RFC2822Parser
     _save = self.pos
     while true # choice
 
-    _save1 = self.pos
-    while true # sequence
-    _save2 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _tmp = match_string("<")
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _tmp = apply(:_addr_hyphen_spec)
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _tmp = match_string(">")
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _save3 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
+      _save1 = self.pos
+      while true # sequence
+        _save2 = self.pos
+        _tmp = apply(:_CFWS)
+        unless _tmp
+          _tmp = true
+          self.pos = _save2
+        end
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _tmp = match_string("<")
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _tmp = apply(:_addr_hyphen_spec)
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _tmp = match_string(">")
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _save3 = self.pos
+        _tmp = apply(:_CFWS)
+        unless _tmp
+          _tmp = true
+          self.pos = _save3
+        end
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
 
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_angle_hyphen_addr)
-    break if _tmp
-    self.pos = _save
-    break
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_angle_hyphen_addr)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_angle_hyphen_addr unless _tmp
@@ -1347,52 +1385,52 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_display_hyphen_name)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = match_string(":")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save1 = self.pos
+      _tmp = apply(:_display_hyphen_name)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string(":")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save1 = self.pos
 
-    _save2 = self.pos
-    while true # choice
-    _tmp = apply(:_mailbox_hyphen_list)
-    break if _tmp
-    self.pos = _save2
-    _tmp = apply(:_CFWS)
-    break if _tmp
-    self.pos = _save2
-    break
-    end # end choice
+      _save2 = self.pos
+      while true # choice
+        _tmp = apply(:_mailbox_hyphen_list)
+        break if _tmp
+        self.pos = _save2
+        _tmp = apply(:_CFWS)
+        break if _tmp
+        self.pos = _save2
+        break
+      end # end choice
 
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string(";")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save3 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save3
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string(";")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save3 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_group unless _tmp
@@ -1412,44 +1450,44 @@ class EmailAddressValidator::RFC2822Parser
     _save = self.pos
     while true # choice
 
-    _save1 = self.pos
-    while true # sequence
-    _tmp = apply(:_mailbox)
-    unless _tmp
-      self.pos = _save1
+      _save1 = self.pos
+      while true # sequence
+        _tmp = apply(:_mailbox)
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        while true
+
+          _save3 = self.pos
+          while true # sequence
+            _tmp = match_string(",")
+            unless _tmp
+              self.pos = _save3
+              break
+            end
+            _tmp = apply(:_mailbox)
+            unless _tmp
+              self.pos = _save3
+            end
+            break
+          end # end sequence
+
+          break unless _tmp
+        end
+        _tmp = true
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
+
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_mbox_hyphen_list)
+      break if _tmp
+      self.pos = _save
       break
-    end
-    while true
-
-    _save3 = self.pos
-    while true # sequence
-    _tmp = match_string(",")
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _tmp = apply(:_mailbox)
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
-
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_mbox_hyphen_list)
-    break if _tmp
-    self.pos = _save
-    break
     end # end choice
 
     set_failed_rule :_mailbox_hyphen_list unless _tmp
@@ -1462,44 +1500,44 @@ class EmailAddressValidator::RFC2822Parser
     _save = self.pos
     while true # choice
 
-    _save1 = self.pos
-    while true # sequence
-    _tmp = apply(:_address)
-    unless _tmp
-      self.pos = _save1
+      _save1 = self.pos
+      while true # sequence
+        _tmp = apply(:_address)
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        while true
+
+          _save3 = self.pos
+          while true # sequence
+            _tmp = match_string(",")
+            unless _tmp
+              self.pos = _save3
+              break
+            end
+            _tmp = apply(:_address)
+            unless _tmp
+              self.pos = _save3
+            end
+            break
+          end # end sequence
+
+          break unless _tmp
+        end
+        _tmp = true
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
+
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_addr_hyphen_list)
+      break if _tmp
+      self.pos = _save
       break
-    end
-    while true
-
-    _save3 = self.pos
-    while true # sequence
-    _tmp = match_string(",")
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _tmp = apply(:_address)
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
-
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_addr_hyphen_list)
-    break if _tmp
-    self.pos = _save
-    break
     end # end choice
 
     set_failed_rule :_address_hyphen_list unless _tmp
@@ -1511,21 +1549,21 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_local_hyphen_part)
-    unless _tmp
-      self.pos = _save
+      _tmp = apply(:_local_hyphen_part)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string("@")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_domain)
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string("@")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = apply(:_domain)
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_addr_hyphen_spec unless _tmp
@@ -1537,16 +1575,16 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_dot_hyphen_atom)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_quoted_hyphen_string)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_obs_hyphen_local_hyphen_part)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_dot_hyphen_atom)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_quoted_hyphen_string)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_obs_hyphen_local_hyphen_part)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_local_hyphen_part unless _tmp
@@ -1559,55 +1597,55 @@ class EmailAddressValidator::RFC2822Parser
     _save = self.pos
     while true # choice
 
-    _save1 = self.pos
-    while true # sequence
-    _text_start = self.pos
-    _tmp = apply(:_dot_hyphen_atom)
-    if _tmp
-      text = get_text(_text_start)
-    end
-    unless _tmp
-      self.pos = _save1
+      _save1 = self.pos
+      while true # sequence
+        _text_start = self.pos
+        _tmp = apply(:_dot_hyphen_atom)
+        if _tmp
+          text = get_text(_text_start)
+        end
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _save2 = self.pos
+        _tmp = begin;  @validate_domain ? EmailAddressValidator::DomainParser.new(text).parse : true ; end
+        self.pos = _save2
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
+
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_domain_hyphen_literal)
+      break if _tmp
+      self.pos = _save
+
+      _save3 = self.pos
+      while true # sequence
+        _text_start = self.pos
+        _tmp = apply(:_obs_hyphen_domain)
+        if _tmp
+          text = get_text(_text_start)
+        end
+        unless _tmp
+          self.pos = _save3
+          break
+        end
+        _save4 = self.pos
+        _tmp = begin;  @validate_domain ? EmailAddressValidator::DomainParser.new(text).parse : true ; end
+        self.pos = _save4
+        unless _tmp
+          self.pos = _save3
+        end
+        break
+      end # end sequence
+
+      break if _tmp
+      self.pos = _save
       break
-    end
-    _save2 = self.pos
-    _tmp = begin;  @validate_domain ? EmailAddressValidator::DomainParser.new(text).parse : true ; end
-    self.pos = _save2
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
-
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_domain_hyphen_literal)
-    break if _tmp
-    self.pos = _save
-
-    _save3 = self.pos
-    while true # sequence
-    _text_start = self.pos
-    _tmp = apply(:_obs_hyphen_domain)
-    if _tmp
-      text = get_text(_text_start)
-    end
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _save4 = self.pos
-    _tmp = begin;  @validate_domain ? EmailAddressValidator::DomainParser.new(text).parse : true ; end
-    self.pos = _save4
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
-
-    break if _tmp
-    self.pos = _save
-    break
     end # end choice
 
     set_failed_rule :_domain unless _tmp
@@ -1619,74 +1657,74 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = match_string("[")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      _save1 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string("[")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save3 = self.pos
-    while true # sequence
-    _save4 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _tmp = apply(:_dcontent)
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
+        _save3 = self.pos
+        while true # sequence
+          _save4 = self.pos
+          _tmp = apply(:_FWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save4
+          end
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _tmp = apply(:_dcontent)
+          unless _tmp
+            self.pos = _save3
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save5 = self.pos
-    _tmp = apply(:_FWS)
-    unless _tmp
+        break unless _tmp
+      end
       _tmp = true
-      self.pos = _save5
-    end
-    unless _tmp
-      self.pos = _save
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save5 = self.pos
+      _tmp = apply(:_FWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save5
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string("]")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save6 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save6
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string("]")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save6 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save6
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_domain_hyphen_literal unless _tmp
@@ -1698,13 +1736,13 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_dtext)
-    break if _tmp
-    self.pos = _save
-    _tmp = apply(:_quoted_hyphen_pair)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_dtext)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply(:_quoted_hyphen_pair)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_dcontent unless _tmp
@@ -1716,16 +1754,16 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(33,90)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(94,126)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply(:_NO_hyphen_WS_hyphen_CTL)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 33,90)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 94,126)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_dtext unless _tmp
@@ -1737,16 +1775,16 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = match_string("\\")
-    unless _tmp
-      self.pos = _save
+      _tmp = match_string("\\")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply_with_args(:_d_btw, 0,127)
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = _d_btw(0,127)
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_qp unless _tmp
@@ -1758,60 +1796,60 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    while true
-    _tmp = apply(:_LF)
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
-    _tmp = apply(:_CR)
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      while true
+        _tmp = apply(:_LF)
+        break unless _tmp
+      end
+      _tmp = true
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
+        _tmp = apply(:_CR)
+        break unless _tmp
+      end
+      _tmp = true
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save4 = self.pos
-    while true # sequence
-    _tmp = apply(:_obs_hyphen_char)
-    unless _tmp
-      self.pos = _save4
-      break
-    end
-    while true
-    _tmp = apply(:_LF)
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save4
-      break
-    end
-    while true
-    _tmp = apply(:_CR)
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save4
-    end
-    break
-    end # end sequence
+        _save4 = self.pos
+        while true # sequence
+          _tmp = apply(:_obs_hyphen_char)
+          unless _tmp
+            self.pos = _save4
+            break
+          end
+          while true
+            _tmp = apply(:_LF)
+            break unless _tmp
+          end
+          _tmp = true
+          unless _tmp
+            self.pos = _save4
+            break
+          end
+          while true
+            _tmp = apply(:_CR)
+            break unless _tmp
+          end
+          _tmp = true
+          unless _tmp
+            self.pos = _save4
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
+        break unless _tmp
+      end
+      _tmp = true
+      unless _tmp
+        self.pos = _save
+      end
+      break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_text unless _tmp
@@ -1823,19 +1861,19 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = _d_btw(0,9)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(11)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d(12)
-    break if _tmp
-    self.pos = _save
-    _tmp = _d_btw(14,127)
-    break if _tmp
-    self.pos = _save
-    break
+      _tmp = apply_with_args(:_d_btw, 0,9)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 11)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d, 12)
+      break if _tmp
+      self.pos = _save
+      _tmp = apply_with_args(:_d_btw, 14,127)
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_obs_hyphen_char unless _tmp
@@ -1854,34 +1892,34 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_word)
-    unless _tmp
-      self.pos = _save
+      _tmp = apply(:_word)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
+
+        _save2 = self.pos
+        while true # choice
+          _tmp = apply(:_word)
+          break if _tmp
+          self.pos = _save2
+          _tmp = match_string(".")
+          break if _tmp
+          self.pos = _save2
+          _tmp = apply(:_CFWS)
+          break if _tmp
+          self.pos = _save2
+          break
+        end # end choice
+
+        break unless _tmp
+      end
+      _tmp = true
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    while true
-
-    _save2 = self.pos
-    while true # choice
-    _tmp = apply(:_word)
-    break if _tmp
-    self.pos = _save2
-    _tmp = match_string(".")
-    break if _tmp
-    self.pos = _save2
-    _tmp = apply(:_CFWS)
-    break if _tmp
-    self.pos = _save2
-    break
-    end # end choice
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_phrase unless _tmp
@@ -1893,120 +1931,120 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # choice
-    _tmp = apply(:_phrase)
-    break if _tmp
-    self.pos = _save
+      _tmp = apply(:_phrase)
+      break if _tmp
+      self.pos = _save
 
-    _save1 = self.pos
-    while true # sequence
-    _save2 = self.pos
+      _save1 = self.pos
+      while true # sequence
+        _save2 = self.pos
 
-    _save3 = self.pos
-    while true # sequence
-    _save4 = self.pos
-    _tmp = apply(:_phrase)
-    unless _tmp
-      _tmp = true
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _save5 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save5
-    end
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _tmp = match_string(",")
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _save6 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save6
-    end
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
+        _save3 = self.pos
+        while true # sequence
+          _save4 = self.pos
+          _tmp = apply(:_phrase)
+          unless _tmp
+            _tmp = true
+            self.pos = _save4
+          end
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _save5 = self.pos
+          _tmp = apply(:_CFWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save5
+          end
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _tmp = match_string(",")
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _save6 = self.pos
+          _tmp = apply(:_CFWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save6
+          end
+          unless _tmp
+            self.pos = _save3
+          end
+          break
+        end # end sequence
 
-    if _tmp
-      while true
-    
-    _save7 = self.pos
-    while true # sequence
-    _save8 = self.pos
-    _tmp = apply(:_phrase)
-    unless _tmp
-      _tmp = true
-      self.pos = _save8
-    end
-    unless _tmp
-      self.pos = _save7
-      break
-    end
-    _save9 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save9
-    end
-    unless _tmp
-      self.pos = _save7
-      break
-    end
-    _tmp = match_string(",")
-    unless _tmp
-      self.pos = _save7
-      break
-    end
-    _save10 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save10
-    end
-    unless _tmp
-      self.pos = _save7
-    end
-    break
-    end # end sequence
+        if _tmp
+          while true
 
-        break unless _tmp
-      end
-      _tmp = true
-    else
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save1
-      break
-    end
-    _save11 = self.pos
-    _tmp = apply(:_phrase)
-    unless _tmp
-      _tmp = true
-      self.pos = _save11
-    end
-    unless _tmp
-      self.pos = _save1
-    end
-    break
-    end # end sequence
+            _save7 = self.pos
+            while true # sequence
+              _save8 = self.pos
+              _tmp = apply(:_phrase)
+              unless _tmp
+                _tmp = true
+                self.pos = _save8
+              end
+              unless _tmp
+                self.pos = _save7
+                break
+              end
+              _save9 = self.pos
+              _tmp = apply(:_CFWS)
+              unless _tmp
+                _tmp = true
+                self.pos = _save9
+              end
+              unless _tmp
+                self.pos = _save7
+                break
+              end
+              _tmp = match_string(",")
+              unless _tmp
+                self.pos = _save7
+                break
+              end
+              _save10 = self.pos
+              _tmp = apply(:_CFWS)
+              unless _tmp
+                _tmp = true
+                self.pos = _save10
+              end
+              unless _tmp
+                self.pos = _save7
+              end
+              break
+            end # end sequence
 
-    break if _tmp
-    self.pos = _save
-    break
+            break unless _tmp
+          end
+          _tmp = true
+        else
+          self.pos = _save2
+        end
+        unless _tmp
+          self.pos = _save1
+          break
+        end
+        _save11 = self.pos
+        _tmp = apply(:_phrase)
+        unless _tmp
+          _tmp = true
+          self.pos = _save11
+        end
+        unless _tmp
+          self.pos = _save1
+        end
+        break
+      end # end sequence
+
+      break if _tmp
+      self.pos = _save
+      break
     end # end choice
 
     set_failed_rule :_obs_hyphen_phrase_hyphen_list unless _tmp
@@ -2018,54 +2056,54 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_WSP)
-    if _tmp
+      _save1 = self.pos
+      _tmp = apply(:_WSP)
+      if _tmp
+        while true
+          _tmp = apply(:_WSP)
+          break unless _tmp
+        end
+        _tmp = true
+      else
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
       while true
-        _tmp = apply(:_WSP)
+
+        _save3 = self.pos
+        while true # sequence
+          _tmp = apply(:_CRLF)
+          unless _tmp
+            self.pos = _save3
+            break
+          end
+          _save4 = self.pos
+          _tmp = apply(:_WSP)
+          if _tmp
+            while true
+              _tmp = apply(:_WSP)
+              break unless _tmp
+            end
+            _tmp = true
+          else
+            self.pos = _save4
+          end
+          unless _tmp
+            self.pos = _save3
+          end
+          break
+        end # end sequence
+
         break unless _tmp
       end
       _tmp = true
-    else
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
-
-    _save3 = self.pos
-    while true # sequence
-    _tmp = apply(:_CRLF)
-    unless _tmp
-      self.pos = _save3
-      break
-    end
-    _save4 = self.pos
-    _tmp = apply(:_WSP)
-    if _tmp
-      while true
-        _tmp = apply(:_WSP)
-        break unless _tmp
+      unless _tmp
+        self.pos = _save
       end
-      _tmp = true
-    else
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save3
-    end
-    break
-    end # end sequence
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
+      break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_FWS unless _tmp
@@ -2077,51 +2115,51 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
+      _save1 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string("<")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save2 = self.pos
+      _tmp = apply(:_obs_hyphen_route)
+      unless _tmp
+        _tmp = true
+        self.pos = _save2
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_addr_hyphen_spec)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string(">")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save3 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save3
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string("<")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save2 = self.pos
-    _tmp = apply(:_obs_hyphen_route)
-    unless _tmp
-      _tmp = true
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = apply(:_addr_hyphen_spec)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = match_string(">")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save3 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_angle_hyphen_addr unless _tmp
@@ -2133,36 +2171,36 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
+      _save1 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save1
+      end
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_obs_hyphen_domain_hyphen_list)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = match_string(":")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save2 = self.pos
+      _tmp = apply(:_CFWS)
+      unless _tmp
+        _tmp = true
+        self.pos = _save2
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = apply(:_obs_hyphen_domain_hyphen_list)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = match_string(":")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _save2 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save2
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_route unless _tmp
@@ -2174,69 +2212,69 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = match_string("@")
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    _tmp = apply(:_domain)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      _tmp = match_string("@")
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _tmp = apply(:_domain)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save2 = self.pos
-    while true # sequence
-    while true
+        _save2 = self.pos
+        while true # sequence
+          while true
 
-    _save4 = self.pos
-    while true # choice
-    _tmp = apply(:_CFWS)
-    break if _tmp
-    self.pos = _save4
-    _tmp = match_string(",")
-    break if _tmp
-    self.pos = _save4
-    break
-    end # end choice
+            _save4 = self.pos
+            while true # choice
+              _tmp = apply(:_CFWS)
+              break if _tmp
+              self.pos = _save4
+              _tmp = match_string(",")
+              break if _tmp
+              self.pos = _save4
+              break
+            end # end choice
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _save5 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
+            break unless _tmp
+          end
+          _tmp = true
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _save5 = self.pos
+          _tmp = apply(:_CFWS)
+          unless _tmp
+            _tmp = true
+            self.pos = _save5
+          end
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = match_string("@")
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = apply(:_domain)
+          unless _tmp
+            self.pos = _save2
+          end
+          break
+        end # end sequence
+
+        break unless _tmp
+      end
       _tmp = true
-      self.pos = _save5
-    end
-    unless _tmp
-      self.pos = _save2
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _tmp = match_string("@")
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _tmp = apply(:_domain)
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
-
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_domain_hyphen_list unless _tmp
@@ -2248,34 +2286,34 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_word)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      _tmp = apply(:_word)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save2 = self.pos
-    while true # sequence
-    _tmp = match_string(".")
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _tmp = apply(:_word)
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
+        _save2 = self.pos
+        while true # sequence
+          _tmp = match_string(".")
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = apply(:_word)
+          unless _tmp
+            self.pos = _save2
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
+        break unless _tmp
+      end
+      _tmp = true
+      unless _tmp
+        self.pos = _save
+      end
+      break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_local_hyphen_part unless _tmp
@@ -2287,34 +2325,34 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_atom)
-    unless _tmp
-      self.pos = _save
-      break
-    end
-    while true
+      _tmp = apply(:_atom)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      while true
 
-    _save2 = self.pos
-    while true # sequence
-    _tmp = match_string(".")
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _tmp = apply(:_atom)
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
+        _save2 = self.pos
+        while true # sequence
+          _tmp = match_string(".")
+          unless _tmp
+            self.pos = _save2
+            break
+          end
+          _tmp = apply(:_atom)
+          unless _tmp
+            self.pos = _save2
+          end
+          break
+        end # end sequence
 
-    break unless _tmp
-    end
-    _tmp = true
-    unless _tmp
-      self.pos = _save
-    end
-    break
+        break unless _tmp
+      end
+      _tmp = true
+      unless _tmp
+        self.pos = _save
+      end
+      break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_domain unless _tmp
@@ -2326,109 +2364,109 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _save1 = self.pos
+      _save1 = self.pos
 
-    _save2 = self.pos
-    while true # sequence
-    _save3 = self.pos
-    _tmp = apply(:_address)
-    unless _tmp
-      _tmp = true
-      self.pos = _save3
-    end
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _save4 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save4
-    end
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _tmp = match_string(",")
-    unless _tmp
-      self.pos = _save2
-      break
-    end
-    _save5 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save5
-    end
-    unless _tmp
-      self.pos = _save2
-    end
-    break
-    end # end sequence
+      _save2 = self.pos
+      while true # sequence
+        _save3 = self.pos
+        _tmp = apply(:_address)
+        unless _tmp
+          _tmp = true
+          self.pos = _save3
+        end
+        unless _tmp
+          self.pos = _save2
+          break
+        end
+        _save4 = self.pos
+        _tmp = apply(:_CFWS)
+        unless _tmp
+          _tmp = true
+          self.pos = _save4
+        end
+        unless _tmp
+          self.pos = _save2
+          break
+        end
+        _tmp = match_string(",")
+        unless _tmp
+          self.pos = _save2
+          break
+        end
+        _save5 = self.pos
+        _tmp = apply(:_CFWS)
+        unless _tmp
+          _tmp = true
+          self.pos = _save5
+        end
+        unless _tmp
+          self.pos = _save2
+        end
+        break
+      end # end sequence
 
-    if _tmp
-      while true
-    
-    _save6 = self.pos
-    while true # sequence
-    _save7 = self.pos
-    _tmp = apply(:_address)
-    unless _tmp
-      _tmp = true
-      self.pos = _save7
-    end
-    unless _tmp
-      self.pos = _save6
-      break
-    end
-    _save8 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save8
-    end
-    unless _tmp
-      self.pos = _save6
-      break
-    end
-    _tmp = match_string(",")
-    unless _tmp
-      self.pos = _save6
-      break
-    end
-    _save9 = self.pos
-    _tmp = apply(:_CFWS)
-    unless _tmp
-      _tmp = true
-      self.pos = _save9
-    end
-    unless _tmp
-      self.pos = _save6
-    end
-    break
-    end # end sequence
+      if _tmp
+        while true
 
-        break unless _tmp
+          _save6 = self.pos
+          while true # sequence
+            _save7 = self.pos
+            _tmp = apply(:_address)
+            unless _tmp
+              _tmp = true
+              self.pos = _save7
+            end
+            unless _tmp
+              self.pos = _save6
+              break
+            end
+            _save8 = self.pos
+            _tmp = apply(:_CFWS)
+            unless _tmp
+              _tmp = true
+              self.pos = _save8
+            end
+            unless _tmp
+              self.pos = _save6
+              break
+            end
+            _tmp = match_string(",")
+            unless _tmp
+              self.pos = _save6
+              break
+            end
+            _save9 = self.pos
+            _tmp = apply(:_CFWS)
+            unless _tmp
+              _tmp = true
+              self.pos = _save9
+            end
+            unless _tmp
+              self.pos = _save6
+            end
+            break
+          end # end sequence
+
+          break unless _tmp
+        end
+        _tmp = true
+      else
+        self.pos = _save1
       end
-      _tmp = true
-    else
-      self.pos = _save1
-    end
-    unless _tmp
-      self.pos = _save
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save10 = self.pos
+      _tmp = apply(:_address)
+      unless _tmp
+        _tmp = true
+        self.pos = _save10
+      end
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _save10 = self.pos
-    _tmp = apply(:_address)
-    unless _tmp
-      _tmp = true
-      self.pos = _save10
-    end
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_obs_hyphen_mbox_hyphen_list unless _tmp
@@ -2440,19 +2478,19 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_address)
-    unless _tmp
-      self.pos = _save
+      _tmp = apply(:_address)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save1 = self.pos
+      _tmp = get_byte
+      _tmp = _tmp ? nil : true
+      self.pos = _save1
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _save1 = self.pos
-    _tmp = get_byte
-    _tmp = _tmp ? nil : true
-    self.pos = _save1
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_root unless _tmp
@@ -2464,19 +2502,19 @@ class EmailAddressValidator::RFC2822Parser
 
     _save = self.pos
     while true # sequence
-    _tmp = apply(:_addr_hyphen_spec)
-    unless _tmp
-      self.pos = _save
+      _tmp = apply(:_addr_hyphen_spec)
+      unless _tmp
+        self.pos = _save
+        break
+      end
+      _save1 = self.pos
+      _tmp = get_byte
+      _tmp = _tmp ? nil : true
+      self.pos = _save1
+      unless _tmp
+        self.pos = _save
+      end
       break
-    end
-    _save1 = self.pos
-    _tmp = get_byte
-    _tmp = _tmp ? nil : true
-    self.pos = _save1
-    unless _tmp
-      self.pos = _save
-    end
-    break
     end # end sequence
 
     set_failed_rule :_only_addr_spec unless _tmp
@@ -2484,8 +2522,8 @@ class EmailAddressValidator::RFC2822Parser
   end
 
   Rules = {}
-  Rules[:_d] = rule_info("d", "< . > &{ text[0] == num }")
-  Rules[:_d_btw] = rule_info("d_btw", "< . > &{ t = text[0]; t >= start && t <= fin }")
+  Rules[:_d] = rule_info("d", "< . > &{ text[0] == num.chr }")
+  Rules[:_d_btw] = rule_info("d_btw", "< . > &{ t = text[0]; t >= start.chr && t <= fin.chr }")
   Rules[:_WSP] = rule_info("WSP", "(\" \" | d(9))")
   Rules[:_LF] = rule_info("LF", "/\\x0A/")
   Rules[:_CR] = rule_info("CR", "/\\x0D/")
@@ -2540,4 +2578,5 @@ class EmailAddressValidator::RFC2822Parser
   Rules[:_obs_hyphen_mbox_hyphen_list] = rule_info("obs-mbox-list", "(address? CFWS? \",\" CFWS?)+ address?")
   Rules[:_root] = rule_info("root", "address !.")
   Rules[:_only_addr_spec] = rule_info("only_addr_spec", "addr-spec !.")
+  # :startdoc:
 end

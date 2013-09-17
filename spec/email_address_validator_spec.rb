@@ -8,8 +8,8 @@ describe EmailAddressValidator do
              "\"Abc@def\"@example.com", "customer/department=shipping@example.com",
              "$A12345@example.com", "!def!xyz%abc@example.com",
              "\"Chris Jones\" <c@a.test>",
-             "Group:\"Chris Jones\" <c@a.test>,joe@where.test,John <jdoe@one.test>;", 
-             "A Group:\"Chris Jones\" <c@a.test>,joe@where.test,John <jdoe@one.test>;", 
+             "Group:\"Chris Jones\" <c@a.test>,joe@where.test,John <jdoe@one.test>;",
+             "A Group:\"Chris Jones\" <c@a.test>,joe@where.test,John <jdoe@one.test>;",
              "l3tt3rsAndNumb3rs@domain.com", "has-dash@domain.com",
              "hasApostrophe.o'leary@domain.org", "uncommonTLD@domain.museum",
              "lettersInDomain@911.com", "underscore_inLocal@domain.net",
@@ -52,11 +52,11 @@ describe EmailAddressValidator do
   VALID_ADDRSPEC = ["l3tt3rsAndNumb3rs@domain.com", "has-dash@domain.com"]
 
   INVALID = INVALID_COMMON
-  
+
   it "should be false with a nil value" do
     EmailAddressValidator.validate_addr(nil).should be_false
   end
-  
+
   VALID.each do |addr|
     it "should recognize <#{addr}> as valid" do
       EmailAddressValidator.validate_822(addr).should be_true

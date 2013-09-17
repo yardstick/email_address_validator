@@ -2,8 +2,8 @@
 
 %% { attr_accessor :validate_domain }
 
-d(num) = <.> &{ text[0] == num }
-d_btw(start,fin) = <.> &{ t = text[0]; t >= start && t <= fin }
+d(num) = <.> &{ text[0] == num.chr }
+d_btw(start,fin) = <.> &{ t = text[0]; t >= start.chr && t <= fin.chr }
 
 WSP = " " | d(9)
 

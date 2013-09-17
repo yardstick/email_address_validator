@@ -50,7 +50,7 @@ module EmailAddressValidator
 
     Dir.glob(search_me).sort.each {|rb| require rb}
   end
-  
+
   # Shorthand for +EmailAddressParser.validate_2822_addr
   def self.validate_addr(addr, validate_domain=false); self.validate_2822(addr, validate_domain); end
 
@@ -59,7 +59,7 @@ module EmailAddressValidator
   # You very well may want to set validate_domain to true as well,
   # as RFC2822 doesn't explicitly require valid domains
   def self.validate_2822_addr(addr, validate_domain=false)
-    parser = RFC2822Parser.new(addr, "only_addr_spec")
+    parser = RFC2822Parser.new(addr.to_s, "only_addr_spec")
     parser.validate_domain = validate_domain
     parser.parse
   end
@@ -69,9 +69,9 @@ module EmailAddressValidator
 
   # Validates an email address according to RFC 2822
   # This validates addresses against the full spec, which
-  # may not be what you want. 
+  # may not be what you want.
   def self.validate_2822(addr, validate_domain=false)
-    parser = RFC2822Parser.new(addr)
+    parser = RFC2822Parser.new(addr.to_s)
     parser.validate_domain = validate_domain
     parser.parse
   end
@@ -79,21 +79,21 @@ module EmailAddressValidator
   # Validates legacy address according to RFC 822, the original
   # email grammar.
   def self.validate_822(addr, validate_domain=false)
-    parser = RFC822Parser.new(addr)
+    parser = RFC822Parser.new(addr.to_s)
     parser.validate_domain = validate_domain
     parser.parse
   end
 
   # Validates only the addr_spec portion an address according to RFC 822
   def self.validate_822_addr(addr, validate_domain=false)
-    parser = RFC822Parser.new(addr, "only_addr_spec")
+    parser = RFC822Parser.new(addr.to_s, "only_addr_spec")
     parser.validate_domain = validate_domain
     parser.parse
   end
 
   # Validates a domain name
   def self.validate_domain(domain)
-    parser = DomainParser.new(addr)
+    parser = DomainParser.new(addr.to_s)
     parser.parse
   end
 
